@@ -1,0 +1,26 @@
+.claude/
+.mimocode/
+.idea/
+.pytest_cache/
+.vscode/
+data/chroma_db/
+data/documents/
+data/ocr_output
+data/pdf_output
+data/pdfs
+*.pyc
+__pycache__/
+.env
+.env.*
+*.egg-info/
+dist/
+build/
+chroma_db/
+**/chroma_db/
+*.sqlite3
+eval_results*
+interview_project_pitch.md
+z_ interview/
+tempCodeRunnerFile.sh
+test.md
+CLAUDE1.md
