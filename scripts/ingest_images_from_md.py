@@ -24,6 +24,7 @@ python scripts/ingest_images_from_md.py --input-dir ./data/ocr_output --reset
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,28 @@ from src.vectorstore.image_store import ImageChromaStore
 
 SUPPORTED_EXTENSIONS = {".md", ".markdown"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"}
+
+
+def load_image_page_map(md_file: Path) -> dict[str, int]:
+    """
+    从 MinerU 的 *_content_list.json 读取图片文件名 → 页码（1 基）映射。
+
+    找不到 content_list 时返回空字典（不阻断入库）。
+    """
+    candidates = sorted(md_file.parent.glob("*_content_list.json"))
+    if not candidates:
+        return {}
+    try:
+        content_list = json.loads(candidates[0].read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[页码] content_list 解析失败：{candidates[0].name}（{exc}）")
+        return {}
+    page_map: dict[str, int] = {}
+    for item in content_list:
+        # MinerU 会把插图分为 image 与 chart（图表/曲线图）两种类型
+        if item.get("type") in ("image", "chart") and item.get("img_path"):
+            page_map[Path(item["img_path"]).name] = int(item.get("page_idx", 0)) + 1
+    return page_map
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +112,7 @@ def extract_local_images(
       caption    — 图注（若有）
     """
     blocks = parser.parse(md_file)
+    image_pages = load_image_page_map(md_file)
     results: list[tuple[Path, dict]] = []
 
     for block in blocks:
@@ -115,11 +139,12 @@ def extract_local_images(
             continue
 
         meta = {
-            "source": md_file.name,
+            "source": md_file.stem,
             "source_abs": str(md_file.resolve()),
             "alt_text": block.metadata.get("alt_text", ""),
             "caption": block.metadata.get("caption", ""),
             "image_url_raw": image_url,  # 原始相对路径，方便调试
+            "page_num": image_pages.get(image_path.name, block.page_num),
         }
         results.append((image_path, meta))
 

@@ -79,6 +79,36 @@ def _summarize_tool_result(tool_name: str, raw: str) -> str:
         )
         return f"找到 {len(results)} 张相关图片：{names}"
 
+    if tool_name == "paper_polishing":
+        if data.get("status") != "ok":
+            return data.get("message", "润色失败")[:120]
+        axes = data.get("axes", {})
+        axes_desc = "/".join(
+            str(v) for v in (
+                axes.get("paper_type"), axes.get("language"), axes.get("journal")
+            ) if v
+        )
+        polished = data.get("polished", "")
+        preview = polished.split("Revision notes:")[0].strip()
+        return f"完成 Nature 风格润色（{axes_desc}）：{preview[:60]}…"
+
+    if tool_name == "paper_search":
+        if not results:
+            return message or "未找到相关论文"
+        titles = "、".join(r.get("title", "")[:30] for r in results[:3])
+        return f"检索到 {len(results)} 篇论文：{titles}…"
+
+    if tool_name == "paper_ingest":
+        if data.get("status") != "success":
+            return data.get("message", "入库失败")[:120]
+        ingested = data.get("ingested", [])
+        total_chunks = data.get("total_chunks", 0)
+        depth_desc = "、".join(
+            f"{r.get('paper_id', '')}({r.get('depth', '')})"
+            for r in ingested[:3]
+        )
+        return f"已入库 {len(ingested)} 篇论文（{total_chunks} chunks）：{depth_desc}"
+
     if results:
         return f"返回 {len(results)} 条结果"
     return raw[:120]
@@ -115,6 +145,18 @@ def _build_system_prompt() -> str:
 - 检索到表格数据需统计分析：用 table_analyzer。
 - 检索结果包含图像路径需理解图像：用 image_describer。
 - 检索片段过长影响回答质量：先用 summarizer 压缩再组合。
+- 学术润色（论文润色、摘要/引言等章节改写、中文学术稿译为发表级英文、
+  SCI 写作优化）：用 paper_polishing，将待润色文本连同论文类型、
+  章节、目标期刊等信息一并传入。
+
+文献检索策略：
+- 用户想调研/搜索近几年某主题的论文（如"搜一下近三年关于XX的论文"）：
+  用 paper_search（topic 传英文关键词），然后基于标题和摘要为每篇论文
+  写 2~3 句简短介绍，并注明年份与 paper_id（可列表格），方便用户引用。
+- 用户要求将已搜索到的论文入库（如"把第 1、3 篇入库"）：用 paper_ingest，
+  传入对应论文的 paper_id 列表；默认摘要级入库，用户明确要求全文时
+  传 depth="fulltext"（仅 arXiv 论文支持，失败自动降级摘要级）。
+- 入库完成后告知用户可以通过知识库检索这些论文了。
 
 回答格式：
 - 使用 Markdown 格式，结构清晰。
@@ -130,10 +172,19 @@ class MultimodalRAGAgent:
 
     参数
     ----
-    retriever : 已初始化的 HybridRetriever（BM25 索引须已构建）。
+    retriever        : 已初始化的 HybridRetriever（BM25 索引须已构建）。
+    store            : 可选，文本向量库。提供后注册 paper_ingest 工具
+                       （文献搜索结果的轻量入库）。
+    sparse_retriever : 可选，BM25 稀疏检索器（与 store 同时提供，
+                       paper_ingest 入库后重建索引）。
     """
 
-    def __init__(self, retriever: HybridRetriever) -> None:
+    def __init__(
+        self,
+        retriever: HybridRetriever,
+        store: Any = None,
+        sparse_retriever: Any = None,
+    ) -> None:
         self._retriever = retriever
         self._llm = ChatOpenAI(
             model=settings.effective_llm_model,
@@ -150,9 +201,25 @@ class MultimodalRAGAgent:
             base_url=settings.dashscope_base_url,
             request_timeout=settings.llm_request_timeout,
         )
+        # 润色专用 LLM：长文本生成任务，需远大于常规问答的超时与输出上限
+        # （常规问答 30s 超时；润色实测 60s+，若共用会在工具内超时报错）
+        self._polishing_llm = ChatOpenAI(
+            model=settings.effective_llm_model,
+            api_key=settings.effective_llm_api_key,
+            base_url=settings.effective_llm_base_url,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.polishing_max_tokens,
+            request_timeout=settings.polishing_request_timeout,
+        )
         self._tools = (
             build_retrieval_tools(retriever, llm=self._llm)
-            + build_skill_tools(llm=self._llm, vl_llm=self._vl_llm)
+            + build_skill_tools(
+                llm=self._llm,
+                vl_llm=self._vl_llm,
+                polishing_llm=self._polishing_llm,
+                store=store,
+                sparse_retriever=sparse_retriever,
+            )
         )
         self._agent = create_react_agent(
             model=self._llm,
@@ -361,7 +428,7 @@ class MultimodalRAGAgent:
                     seen.add(key)
                     sources.append({
                         "source": result.get("source") or file_name or "image",
-                        "page": "-",
+                        "page": str(result.get("page", "-")),
                         "block_type": "figure",
                         "content": alt or file_name,
                         "source_path": src_path,
@@ -369,6 +436,18 @@ class MultimodalRAGAgent:
                             f"/v1/images/file?path={src_path}" if src_path else ""
                         ),
                         "score": result.get("score"),
+                    })
+                elif block_type == "literature":
+                    pid = result.get("paper_id", "")
+                    key = f"lit:{pid}"
+                    if not pid or key in seen:
+                        continue
+                    seen.add(key)
+                    sources.append({
+                        "source": pid,
+                        "page": str(result.get("year", "-")),
+                        "block_type": "literature",
+                        "content": result.get("title", ""),
                     })
                 else:
                     text = result.get("content", "")

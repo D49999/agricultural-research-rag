@@ -88,7 +88,10 @@ async def lifespan(app: FastAPI):
 
     reranker = QwenReranker()
     hybrid = HybridRetriever(dense, _sparse_retriever, reranker, image_store=_image_store)
-    _agent = MultimodalRAGAgent(hybrid)
+    # 传入 store / sparse_retriever 以注册文献入库工具（paper_ingest）
+    _agent = MultimodalRAGAgent(
+        hybrid, store=_store, sparse_retriever=_sparse_retriever
+    )
 
     logger.info("系统就绪。")
     yield
@@ -426,6 +429,7 @@ async def image_search(
                 alt_text=meta.get("alt_text", ""),
                 caption=meta.get("caption", ""),
                 source=meta.get("source", ""),
+                page=str(meta.get("page_num", "-")),
                 score=round(float(score), 4),
                 image_url=f"/v1/images/file?path={src_path}" if src_path else "",
             )

@@ -92,11 +92,12 @@ class TestSourceExtraction:
     def test_deduplicates_sources(self):
         from src.agent.rag_agent import MultimodalRAGAgent
 
+        # 内容相同的结果（如多轮检索重复命中）应按内容去重
         obs = json.dumps(
             {
                 "results": [
-                    {"source": "doc.pdf", "page": 1, "block_type": "text", "content": "a", "rank": 1},
-                    {"source": "doc.pdf", "page": 1, "block_type": "text", "content": "b", "rank": 2},
+                    {"source": "doc.pdf", "page": 1, "block_type": "text", "content": "同一段内容", "rank": 1},
+                    {"source": "doc.pdf", "page": 1, "block_type": "text", "content": "同一段内容", "rank": 2},
                 ]
             }
         )
@@ -104,7 +105,7 @@ class TestSourceExtraction:
             ToolMessage(content=obs, tool_call_id="call_1"),
         ]
         sources = MultimodalRAGAgent._extract_sources(messages)
-        assert len(sources) == 1  # 同一 source:page 已去重
+        assert len(sources) == 1  # 相同内容已去重
 
     def test_handles_invalid_json_gracefully(self):
         from src.agent.rag_agent import MultimodalRAGAgent

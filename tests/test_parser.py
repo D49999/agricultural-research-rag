@@ -11,29 +11,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.document_parser.base_parser import BlockType, BoundingBox, ParsedBlock
+from src.document_parser.base_parser import BlockType, ParsedBlock
 from src.document_parser.chunker import StructureAwareChunker
 from src.document_parser.text_parser import TextParser
 
 
-# ── ParsedBlock / BoundingBox ─────────────────────────────────────────────
-
-class TestBoundingBox:
-    def test_area(self):
-        bbox = BoundingBox(0.1, 0.1, 0.5, 0.6, page=0)
-        assert abs(bbox.area - 0.2) < 1e-6
-
-    def test_zero_area(self):
-        bbox = BoundingBox(0.5, 0.5, 0.5, 0.5)
-        assert bbox.area == 0.0
-
+# ── ParsedBlock ─────────────────────────────────────────────────────────
 
 class TestParsedBlock:
     def test_to_langchain_document(self):
         block = ParsedBlock(
             content="Hello world",
             block_type=BlockType.TEXT,
-            bbox=BoundingBox(0, 0, 1, 1),
             page_num=2,
             metadata={"avg_font_size": 12.0},
         )
@@ -43,10 +32,12 @@ class TestParsedBlock:
         assert doc["metadata"]["block_type"] == "text"
         assert doc["metadata"]["avg_font_size"] == 12.0
 
-    def test_to_langchain_document_no_bbox(self):
-        block = ParsedBlock(content="No bbox", block_type=BlockType.HEADER)
+    def test_to_langchain_document_minimal(self):
+        block = ParsedBlock(content="Minimal", block_type=BlockType.HEADER)
         doc = block.to_langchain_document()
-        assert doc["metadata"]["bbox"] is None
+        assert doc["page_content"] == "Minimal"
+        assert doc["metadata"]["block_type"] == "header"
+        assert doc["metadata"]["page_num"] == 0
 
 
 # ── TextParser ────────────────────────────────────────────────────────────
@@ -97,9 +88,10 @@ class TestTextParser:
             headers = [b for b in blocks if b.block_type == BlockType.HEADER]
             texts = [b for b in blocks if b.block_type == BlockType.TEXT]
             assert len(headers) == 2
-            assert headers[0].content == "标题一"
+            # HEADER 块保留完整标题行（含 # 前缀）
+            assert headers[0].content == "# 标题一"
             assert headers[0].metadata["heading_level"] == 1
-            assert headers[1].content == "标题二"
+            assert headers[1].content == "## 标题二"
             assert headers[1].metadata["heading_level"] == 2
             assert len(texts) >= 2
         finally:
@@ -149,7 +141,6 @@ class TestStructureAwareChunker:
         return ParsedBlock(
             content=content,
             block_type=BlockType.TEXT,
-            bbox=BoundingBox(0, 0, 1, 0.1, page),
             page_num=page,
         )
 

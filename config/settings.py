@@ -68,6 +68,21 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_request_timeout: int = 30
 
+    # ── 文献搜索 skill（paper_search / paper_ingest） ─────────────────────
+    # 搜索到的论文保存为 markdown 的目录（摘要级与全文级共用）
+    literature_dir: str = "./data/literature"
+    paper_search_max_results: int = 8          # 单次搜索默认返回论文数
+    paper_search_year_window: int = 3          # "近几年"默认时间窗（年）
+    paper_fetch_timeout: int = 20              # 论文元数据/全文抓取超时（秒）
+    paper_fulltext_max_chars: int = 150_000    # 全文 markdown 字符上限（防超大页面）
+
+    # ── nature-polishing skill（学术润色） ──────────────────────────────────
+    # skill 静态片段根目录（含 manifest.yaml），可用 NATURE_POLISHING_SKILL_DIR 覆盖
+    nature_polishing_skill_dir: str = "E:/agent-learning/nature-skills/skills/nature-polishing"
+    # 润色为长文本生成任务：需远大于常规问答的请求超时与输出 token 上限
+    polishing_request_timeout: int = 300
+    polishing_max_tokens: int = 8192
+
     # ── API 服务 ───────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000

@@ -27,6 +27,8 @@ python scripts/ingest_ocr_output.py --chunk-strategy markdown
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -37,6 +39,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from config.settings import get_settings
+from src.document_parser.base_parser import BlockType
 from src.document_parser.chunker import SUPPORTED_STRATEGIES, chunk_blocks
 from src.document_parser.text_parser import TextParser
 from src.retrieval.sparse_retriever import SparseRetriever
@@ -116,6 +119,115 @@ def collect_md_files(ocr_dir: Path) -> list[tuple[Path, str]]:
     return results
 
 
+# ── 页码回填 ──────────────────────────────────────────────────────────────
+# MinerU 的 content_list.json 中每个块携带 page_idx（0 基），
+# 而 Markdown 本身不含页码。这里通过内容前缀匹配（双指针顺序推进）
+# 将页码回填到 TextParser 解析出的 block，供下游 chunk 元数据使用。
+
+_NORM_KEEP_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_PREFIX_LEN = 60
+_SEARCH_WINDOW = 150
+
+
+def _normalize_text(text: str) -> str:
+    """去空白/标点后仅保留字母数字与中文，用于模糊前缀匹配。"""
+    return _NORM_KEEP_RE.sub("", text or "")
+
+
+def _find_content_list(md_path: Path) -> Path | None:
+    """在 md 所在目录及文档根目录中查找 *_content_list.json。"""
+    for directory in (md_path.parent, *md_path.parents):
+        candidates = sorted(directory.glob("*_content_list.json"))
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def assign_page_numbers(md_path: Path, blocks: list) -> int:
+    """
+    根据 content_list.json 回填 blocks 的 page_num（1 基页码）。
+
+    返回成功回填页码的 block 数量；无 content_list 时不做任何修改。
+    """
+    cl_path = _find_content_list(md_path)
+    if cl_path is None:
+        logger.warning(f"[页码] 未找到 content_list，页码保持默认：{md_path.name}")
+        return 0
+
+    try:
+        content_list = json.loads(cl_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[页码] content_list 解析失败（{exc}）：{cl_path.name}")
+        return 0
+
+    # 按文件顺序保留带页码的文本/表格条目（归一化后非空）
+    entries: list[tuple[str, int]] = []
+    # 图片 basename → 页码
+    image_pages: dict[str, int] = {}
+    for item in content_list:
+        page_idx = int(item.get("page_idx", 0))
+        itype = item.get("type", "")
+        # MinerU 会把插图分为 image 与 chart（图表/曲线图）两种类型
+        if itype in ("image", "chart"):
+            img_path = item.get("img_path", "")
+            if img_path:
+                image_pages[Path(img_path).name] = page_idx + 1
+        elif itype in ("text", "table"):
+            norm = _normalize_text(item.get("text", ""))
+            if norm:
+                entries.append((norm, page_idx + 1))
+
+    assigned = 0
+    cursor = 0
+    last_page = 1
+
+    for block in blocks:
+        # 图片块：按 image_url 的文件名匹配
+        if block.block_type == BlockType.FIGURE:
+            url = block.metadata.get("image_url", "")
+            if url:
+                page = image_pages.get(Path(url).name)
+                if page:
+                    block.page_num = page
+                    last_page = page
+                    assigned += 1
+                    continue
+
+        # 文本/表格/标题块：用归一化前缀在条目序列中向前搜索
+        if block.block_type == BlockType.HEADER:
+            probe = _normalize_text(block.content.lstrip("#").strip())
+        else:
+            probe = _normalize_text(block.content)
+
+        if probe:
+            probe = probe[:_PREFIX_LEN]
+            hit = None
+            for j in range(cursor, min(cursor + _SEARCH_WINDOW, len(entries))):
+                if entries[j][0].startswith(probe):
+                    hit = j
+                    break
+            if hit is None:
+                # 容错：短块（标题等）可能被合并在长条目内部
+                for j in range(cursor, min(cursor + _SEARCH_WINDOW, len(entries))):
+                    if probe and probe in entries[j][0][: len(probe) * 4]:
+                        hit = j
+                        break
+            if hit is not None:
+                block.page_num = entries[hit][1]
+                last_page = entries[hit][1]
+                cursor = hit + 1
+                assigned += 1
+                continue
+
+        # 未匹配到：继承上一个已知页码
+        block.page_num = last_page
+
+    logger.info(
+        f"[页码] {md_path.name}：{assigned}/{len(blocks)} 个 block 完成页码回填"
+    )
+    return assigned
+
+
 def main() -> None:
     _start_time = time.time()
     args = parse_args()
@@ -149,6 +261,7 @@ def main() -> None:
     for md_path, doc_name in tqdm(md_files, desc="入库中", unit="文档"):
         try:
             blocks = text_parser.parse(md_path)
+            assign_page_numbers(md_path, blocks)
             chunks = chunk_blocks(
                 blocks=blocks,
                 strategy=args.chunk_strategy,

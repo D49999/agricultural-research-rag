@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import argparse
 import asyncio
 import os
 import tempfile
@@ -69,7 +70,7 @@ def build_form_data(
         return_md=True,              # 返回 Markdown 格式结果
         return_middle_json=False,    # 不返回中间 JSON
         return_model_output=False,   # 不返回模型原始输出
-        return_content_list=False,   # 不返回内容列表
+        return_content_list=True,    # 返回内容列表（含每个块的 page_idx，用于页码回填）
         return_images=True,          # 返回提取出的图片
         response_format_zip=True,    # 结果打包为 zip
         return_original_file=False,  # 不返回原始文件
@@ -221,14 +222,28 @@ async def run_demo(
     print(f"Extracted result to: {output_path}")
 
 
+def parse_args() -> argparse.Namespace:
+    """可选 CLI 参数，缺省时使用 data/pdfs → data/ocr_output 默认路径。
+
+    提示：Windows 上 mineru-api 临时输出目录 + 超长文件名可能突破 260 字符
+    路径限制（写 content_list.json 时报 FileNotFoundError），此时可用
+    --input/--output 指定短路径目录规避。
+    """
+    parser = argparse.ArgumentParser(description="MinerU OCR 批量解析脚本")
+    parser.add_argument("--input", type=Path, default=None, help="输入文件/目录（默认 data/pdfs）")
+    parser.add_argument("--output", type=Path, default=None, help="输出目录（默认 data/ocr_output）")
+    return parser.parse_args()
+
+
 def main() -> None:
     # demo_dir = Path(__file__).resolve().parent
     demo_dir = Path("data")
+    args = parse_args()
 
     # 输入可以是单个支持格式的文件，也可以是包含多个文件的目录
-    input_path = demo_dir / "pdfs"
+    input_path = args.input or demo_dir / "pdfs"
     # 解析结果将解压到此目录
-    output_dir = demo_dir / "ocr_output"
+    output_dir = args.output or demo_dir / "ocr_output"
     # 指定已有的 MinerU FastAPI 服务地址，例如：
     # "http://127.0.0.1:8000"
     # 设为 None 时会自动在本地启动临时 mineru-api 服务
@@ -240,7 +255,7 @@ def main() -> None:
     # "vlm-auto-engine"      -> 本地 VLM 解析
     # "vlm-http-client"      -> 远程 OpenAI 兼容 VLM 服务
     # "hybrid-http-client"   -> 远程 OpenAI 兼容混合服务
-    backend = "hybrid-auto-engine"
+    backend = "pipeline"
     # 解析方式：
     # "auto" -> 自动选择文本提取或 OCR
     # "txt"  -> 强制文本提取
@@ -249,7 +264,7 @@ def main() -> None:
     # OCR 语言提示，主要用于 pipeline 和 hybrid 后端
     language = "ch"
     # 是否启用公式解析
-    formula_enable = True
+    formula_enable = False
     # 是否启用表格解析
     table_enable = True
     # 仅 "*-http-client" 后端需要，例如：

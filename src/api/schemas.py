@@ -130,6 +130,7 @@ class ImageSearchResult(BaseModel):
     alt_text: str = ""        # Markdown 中的 alt 描述
     caption: str = ""         # 图注文字
     source: str = ""          # 来源 md 文件名
+    page: str = "-"           # 图片所在页码（1 基，未知时为 "-"）
     score: float              # 余弦相似度分数（0~1）
     image_url: str = ""       # 后端图片服务 URL（/v1/images/file?path=...）
 

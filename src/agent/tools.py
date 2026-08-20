@@ -220,6 +220,7 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
                     "alt_text": meta.get("alt_text", ""),
                     "caption": meta.get("caption", ""),
                     "source": meta.get("source", ""),
+                    "page": str(meta.get("page_num", "-")),
                     "block_type": "figure",
                 }
             )

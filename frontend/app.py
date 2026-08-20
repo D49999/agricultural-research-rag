@@ -257,7 +257,7 @@ if page == "科研文档浏览":
                 content = item.get("content", "")
                 metadata = item.get("metadata", {})
                 source = metadata.get("source", "未知")
-                page_num = metadata.get("page", "-")
+                page_num = metadata.get("page_num", metadata.get("page", "-"))
                 block_type = metadata.get("block_type", "-")
                 badge_bg = _TYPE_COLORS.get(str(block_type).lower(), "#f3f4f6")
 
@@ -369,6 +369,8 @@ elif page == "科研问答":
         "table_analyzer": ("📊", "表格分析"),
         "image_describer": ("🖼️", "图像理解"),
         "summarizer": ("📝", "文本摘要"),
+        "paper_search": ("📚", "文献搜索"),
+        "paper_ingest": ("📥", "文献入库"),
     }
 
     def _render_tool_steps(tool_steps: list[dict]) -> None:

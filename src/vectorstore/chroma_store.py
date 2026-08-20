@@ -210,6 +210,22 @@ class ChromaVectorStore:
         col.delete(ids=ids)
         logger.info(f"[ChromaStore] 已删除 {len(ids)} 条文档")
 
+    def delete_documents_by_filter(self, where: dict[str, Any]) -> int:
+        """
+        按元数据过滤条件删除文档，返回删除的文档数量。
+
+        参数
+        ----
+        where : Chroma 元数据过滤字典，例如 {"paper_id": {"$eq": "arxiv:2401.12345"}}。
+        """
+        col = self._client.get_collection(self.collection_name)
+        result = col.get(where=where, include=[])
+        ids = result.get("ids", [])
+        if ids:
+            col.delete(ids=ids)
+            logger.info(f"[ChromaStore] 按过滤条件删除 {len(ids)} 条文档：{where}")
+        return len(ids)
+
     def update_document(self, doc_id: str, content: str, metadata: dict) -> None:
         """
         更新单个文档的内容和元数据，并重新计算嵌入向量。

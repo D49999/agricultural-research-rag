@@ -22,16 +22,14 @@ class TestTokenise:
         assert "world" in tokens
 
     def test_cjk(self):
+        # jieba 分词："人工智能" 作为整词切出
         tokens = _tokenise("人工智能")
-        assert "人" in tokens
-        assert "工" in tokens
-        assert "智" in tokens
-        assert "能" in tokens
+        assert "人工智能" in tokens
 
     def test_mixed(self):
         tokens = _tokenise("AI人工智能 model")
         assert "model" in tokens
-        assert "人" in tokens
+        assert "人工智能" in tokens
 
     def test_punctuation_removed(self):
         tokens = _tokenise("hello, world!")

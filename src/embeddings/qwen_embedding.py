@@ -20,7 +20,17 @@ from config.settings import get_settings
 
 settings = get_settings()
 
-_BATCH_SIZE = 25  # DashScope 单次 API 调用的文本条数上限
+# DashScope 单次 API 调用的文本条数上限（按模型区分）
+# text-embedding-v4: 10；text-embedding-v3: 25；其余模型保守取 10
+_MODEL_BATCH_LIMITS = {
+    "text-embedding-v3": 25,
+    "text-embedding-v4": 10,
+}
+_DEFAULT_BATCH_LIMIT = 10
+
+
+def _batch_limit_for(model: str) -> int:
+    return _MODEL_BATCH_LIMITS.get(model, _DEFAULT_BATCH_LIMIT)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -143,9 +153,9 @@ class QwenAPIEmbeddings(Embeddings):
 
     参数
     ----
-    model      : DashScope 模型名称（默认：text-embedding-v3）。
+    model      : DashScope 模型名称（默认从 settings.embedding_model 读取）。
     normalize  : 是否对输出向量进行 L2 归一化（余弦相似度场景推荐开启）。
-    batch_size : 每次 API 调用的文本数量（DashScope 上限 25）。
+    batch_size : 每次 API 调用的文本数量（按模型自动钳制：v4 上限 10，v3 上限 25）。
     dimensions : 传给 API 的向量维度提示（默认 1024）。
     """
 
@@ -153,14 +163,14 @@ class QwenAPIEmbeddings(Embeddings):
         self,
         model: str | None = None,
         normalize: bool = True,
-        batch_size: int = _BATCH_SIZE,
+        batch_size: int = _DEFAULT_BATCH_LIMIT,
         dimensions: int = 1024,
     ) -> None:
         from openai import OpenAI
 
         self.model = model or settings.embedding_model
         self.normalize = normalize
-        self.batch_size = min(batch_size, _BATCH_SIZE)
+        self.batch_size = min(batch_size, _batch_limit_for(self.model))
         self.dimensions = dimensions
         self._client = OpenAI(
             api_key=settings.dashscope_api_key,

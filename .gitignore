@@ -24,3 +24,6 @@ z_ interview/
 tempCodeRunnerFile.sh
 test.md
 CLAUDE1.md
+.workbuddy/
+data/modelscope_cache/
+data/knowledge_graph/
