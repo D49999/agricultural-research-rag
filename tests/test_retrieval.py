@@ -104,6 +104,14 @@ class TestHybridRetriever:
         shared_count = sum(1 for d in result if d.page_content == "shared content")
         assert shared_count == 1
 
+    def test_explicit_zero_weight_is_respected(self):
+        """消融实验传入 0 权重时不能被默认值覆盖。"""
+        hybrid = HybridRetriever(
+            MagicMock(), MagicMock(), reranker=None, dense_weight=0.0, sparse_weight=1.0
+        )
+        assert hybrid.dense_weight == 0.0
+        assert hybrid.sparse_weight == 1.0
+
     def test_falls_back_when_sparse_not_ready(self):
         dense_mock = MagicMock()
         sparse_mock = MagicMock()

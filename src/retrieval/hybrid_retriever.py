@@ -25,12 +25,14 @@ RRF 公式
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.documents import Document
 from loguru import logger
 
 from config.settings import get_settings
+from src.agri.filters import build_chroma_where, describe_filters, normalize_filters
 from .dense_retriever import DenseRetriever
 from .sparse_retriever import SparseRetriever
 from .reranker import QwenReranker
@@ -41,6 +43,19 @@ if TYPE_CHECKING:
 settings = get_settings()
 
 _RRF_K = 60  # 标准 RRF 常数
+
+
+@dataclass
+class RetrievalOutcome:
+    """一次检索的完整结果，包含过滤条件与实际生效情况。"""
+
+    documents: list[Document] = field(default_factory=list)
+    filters: dict[str, Any] = field(default_factory=dict)
+    relaxed: bool = False
+
+    @property
+    def filter_description(self) -> str:
+        return describe_filters(self.filters) if self.filters else "无"
 
 
 class HybridRetriever:
@@ -80,8 +95,8 @@ class HybridRetriever:
         self.sparse = sparse_retriever
         self.reranker = reranker
         self.image_store = image_store
-        self.dense_weight = dense_weight or settings.dense_weight
-        self.sparse_weight = sparse_weight or settings.sparse_weight
+        self.dense_weight = settings.dense_weight if dense_weight is None else dense_weight
+        self.sparse_weight = settings.sparse_weight if sparse_weight is None else sparse_weight
 
     # ──────────────────────────────────────────────────────────────────────
     # 文本检索
@@ -94,6 +109,7 @@ class HybridRetriever:
         sparse_k: int | None = None,
         rerank_k: int | None = None,
         final_k: int | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[Document]:
         """
         文本检索流水线：稠密 + 稀疏 → RRF → (可选) Reranker。
@@ -105,22 +121,64 @@ class HybridRetriever:
         sparse_k  : 稀疏召回数量（默认：settings.sparse_top_k）。
         rerank_k  : 送入重排器的候选数量（默认：settings.rerank_top_k）。
         final_k   : 最终返回数量（默认：settings.final_top_k）。
+        filters   : 农业元数据过滤条件（作物/病害/地区/年份等）。
 
         返回
         ----
         按相关性降序排列的文本 Document 列表。
+        """
+        return self.retrieve_with_info(
+            query,
+            dense_k=dense_k,
+            sparse_k=sparse_k,
+            rerank_k=rerank_k,
+            final_k=final_k,
+            filters=filters,
+        ).documents
+
+    def retrieve_with_info(
+        self,
+        query: str,
+        dense_k: int | None = None,
+        sparse_k: int | None = None,
+        rerank_k: int | None = None,
+        final_k: int | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> RetrievalOutcome:
+        """
+        与 retrieve() 相同的流水线，但额外返回过滤条件是否被放宽。
+
+        当过滤条件过严导致两路召回都为空时，自动回退到全库检索，
+        并在 relaxed=True 中标记，供 Agent 在回答中提示用户。
         """
         dense_k = dense_k or settings.dense_top_k
         sparse_k = sparse_k or settings.sparse_top_k
         rerank_k = rerank_k or settings.rerank_top_k
         final_k = final_k or settings.final_top_k
 
-        dense_results = self.dense.retrieve(query, k=dense_k)
+        filters = normalize_filters(filters)
+        chroma_where = build_chroma_where(filters)
+
+        dense_results = self.dense.retrieve(query, k=dense_k, filter=chroma_where)
         sparse_results = (
-            self.sparse.retrieve(query, k=sparse_k)
+            self.sparse.retrieve(query, k=sparse_k, filters=filters)
             if self.sparse.is_ready
             else []
         )
+
+        relaxed = False
+        if filters and not dense_results and not sparse_results:
+            logger.info(
+                f"[HybridRetriever] 过滤条件下无召回，放宽为全库检索："
+                f"{describe_filters(filters)}"
+            )
+            relaxed = True
+            dense_results = self.dense.retrieve(query, k=dense_k)
+            sparse_results = (
+                self.sparse.retrieve(query, k=sparse_k)
+                if self.sparse.is_ready
+                else []
+            )
 
         fused = self._rrf_fuse(dense_results, sparse_results)
         candidates = fused[: rerank_k if self.reranker else final_k]
@@ -128,6 +186,8 @@ class HybridRetriever:
         logger.info(
             f"[HybridRetriever] 稠密={len(dense_results)} "
             f"稀疏={len(sparse_results)} → 融合后={len(fused)} 候选"
+            + (f" | 过滤：{describe_filters(filters)}" if filters else "")
+            + ("（已放宽）" if relaxed else "")
         )
 
         if self.reranker and candidates:
@@ -136,7 +196,11 @@ class HybridRetriever:
         else:
             candidates = candidates[:final_k]
 
-        return candidates
+        return RetrievalOutcome(
+            documents=candidates,
+            filters=filters,
+            relaxed=relaxed,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # 图像检索

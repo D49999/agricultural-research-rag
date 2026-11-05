@@ -9,33 +9,28 @@
 """
 from __future__ import annotations
 
-import re
 from typing import Optional
 
-import jieba
+import numpy as np
 from langchain_core.documents import Document
 from loguru import logger
 from rank_bm25 import BM25Okapi
 
 from config.settings import get_settings
+from src.agri.filters import metadata_matches, normalize_filters
+from src.agri.lexicon import tokenize as agri_tokenize
 
 settings = get_settings()
-
-_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 
 
 def _tokenise(text: str) -> list[str]:
     """
-    支持中英文的分词器：
-    • 中文使用 jieba 分词。
-    • 英文按空格分词。
-    • 移除标点符号，转小写。
+    支持中英文的农业增强分词器：
+    • 中文使用 jieba，并加载农业词典（作物/病害/品种/农药）；
+    • 英文按空格分词；
+    • 词典命中的规范名会补回 token，避免长尾术语被切碎。
     """
-    text = _PUNCT.sub(" ", text.lower())
-    # 使用 jieba 分词，自动处理中英混合文本
-    tokens = jieba.cut(text)
-    # 过滤空白 token
-    return [token.strip() for token in tokens if token.strip()]
+    return agri_tokenize(text)
 
 
 class SparseRetriever:
@@ -82,14 +77,16 @@ class SparseRetriever:
         self,
         query: str,
         k: Optional[int] = None,
+        filters: Optional[dict] = None,
     ) -> list[tuple[Document, float]]:
         """
         按 BM25 分数返回 top-k 文档，分数归一化到 [0, 1]。
 
         参数
         ----
-        query : 原始查询字符串。
-        k     : 返回结果数量（默认使用 settings.sparse_top_k）。
+        query   : 原始查询字符串。
+        k       : 返回结果数量（默认使用 settings.sparse_top_k）。
+        filters : 可选的农业元数据过滤条件（作物/病害/地区/年份等）。
 
         返回
         ----
@@ -104,12 +101,29 @@ class SparseRetriever:
         tokens = _tokenise(query)
         scores = self._bm25.get_scores(tokens)  # ndarray，长度等于语料库大小
 
+        filters = normalize_filters(filters)
+        if filters:
+            mask = np.array(
+                [
+                    metadata_matches(doc.metadata, filters, pre_normalized=True)
+                    for doc in self._documents
+                ],
+                dtype=bool,
+            )
+            if not mask.any():
+                logger.debug(f"[SparseRetriever] 元数据过滤后无候选：{filters}")
+                return []
+            scores = np.where(mask, scores, -1.0)
+
         # 按分数降序排列索引，取 top-k
         top_indices = sorted(
             range(len(scores)), key=lambda i: scores[i], reverse=True
         )[:k]
 
-        max_score = scores[top_indices[0]] if top_indices else 1.0
+        if not top_indices or scores[top_indices[0]] <= 0:
+            return []
+
+        max_score = scores[top_indices[0]]
         results: list[tuple[Document, float]] = []
         for idx in top_indices:
             raw_score = float(scores[idx])
