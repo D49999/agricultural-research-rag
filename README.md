@@ -50,7 +50,7 @@ cp .env.example .env
 
 ```bash
 # 1. 预处理：PDF/扫描件 → 结构化 Markdown
-python scripts/mineru_ocr.py --input-dir ./data/documents
+python scripts/mineru_ocr.py --input ./data/documents
 
 # 2. 入库：文本 + 图片分别向量化
 python scripts/ingest_ocr_output.py
@@ -127,6 +127,8 @@ bash launch.sh
               科研问答 · 图片检索 · 文档管理
 ```
 
+> 架构取舍、实测数据与优化路线的完整说明见 [`docs/技术亮点与项目总结.md`](docs/技术亮点与项目总结.md)。
+
 ### 关键设计选择
 
 **为什么文本和图像分开两个集合？**
@@ -141,13 +143,91 @@ bash launch.sh
 
 农业科研数据可能涉及未公开的实验数据和品种信息。本地推理模式让整个 RAG 流水线完全离线运行，数据不出本地环境。
 
+### 农业元数据与结构化检索（P0）
+
+入库时为每个 chunk 抽取农业元数据，检索时先用问题中的明确条件收窄范围，再走稠密 + 稀疏融合：
+
+| 字段 | 示例 | 用途 |
+|------|------|------|
+| `crop` | 水稻 | 作物过滤 |
+| `disease` / `pest` | 稻瘟病 / 二化螟 | 病害、虫害过滤 |
+| `pesticide` | 三环唑 | 农药过滤 |
+| `region` | 长江中下游 | 适用区域过滤 |
+| `growth_stage` | 分蘖期 | 生育期过滤 |
+| `variety` | 郑单958 | 品种过滤 |
+| `year` | 2021 | 年份下限过滤 |
+| `doc_type` / `authority_level` | 标准 / 1 | 资料类型与权威等级过滤 |
+
+- 抽取完全基于规则，离线可跑，不调用 LLM，也不新增外部 API 依赖。
+- 别名自动归一（稻热病 → 稻瘟病、土豆 → 马铃薯），保证 Chroma 过滤能精确命中。
+- 过滤条件同时作用于 Chroma `where` 和内存 BM25；条件过严导致零召回时自动放宽，并在工具返回中标记 `relaxed=true`。
+- 问题里没有明确出现的条件不会加入过滤，避免过度约束。
+- 开关：`ENABLE_AGRI_METADATA=true`（默认）。旧索引没有农业元数据也能正常检索，重新入库后过滤收益更明显。
+
+```bash
+# 查询理解示例：自动得到 crop=水稻、disease=稻瘟病、region=长江中下游、year_min=2024
+python -c "from src.agri import understand_query; print(understand_query('近三年长江中下游水稻稻热病怎么防治').as_dict())"
+```
+
+#### 给旧索引回填农业元数据
+
+在农业元数据上线之前入库的 chunk 没有这些字段，带条件的检索只会「命中 0 条 → 放宽为全库」。
+回填脚本按 `source` 把 chunk 归并成文档重新抽取，**只更新 metadata，不重算向量、不删除文档**：
+
+```bash
+# 默认 dry-run，只打印统计与样例
+python scripts/backfill_agri_metadata.py
+
+# 真正写回（建议先停止后端，避免 Chroma 写锁争用）
+python scripts/backfill_agri_metadata.py --apply
+
+# 覆盖已有农业字段 / 只处理前 N 条
+python scripts/backfill_agri_metadata.py --apply --overwrite --limit 500
+
+# 抽取规则变更后：覆盖并删除旧规则误标的字段（如 crop=棉花）
+python scripts/backfill_agri_metadata.py --apply --overwrite --prune
+```
+
+脚本可反复执行（幂等）。回填后需**重启后端**，让内存 BM25 索引带上新元数据。
+
+作物判定规则：
+- 优先取标题（Markdown 一级标题或文件名）里的作物；正文频繁出现的轮作/间套作作物不会抢走主题作物；
+- 「棉铃虫」「甜菜夜蛾」等多食性害虫名里的作物前缀不会被误判成 crop；
+- 英文别名按整词匹配，避免 `tea` 命中 `instead` 这类子串误报。
+
+#### 补充中文农业语料
+
+`scripts/fetch_zh_literature.py` 直接抓取农业农村部「农事指导」栏目与历年「春耕技术指导」专栏里公开的技术方案 / 指导意见，存成带来源链接的 Markdown：
+
+```bash
+# 抓取到 data/documents/zh（默认每个列表页翻 2 页，最多 40 篇）
+python scripts/fetch_zh_literature.py --pages 2 --max-docs 40
+
+# 入库（注意：不要加 --reset，否则会清空整个集合）
+python scripts/ingest_documents.py --input-dir ./data/documents/zh --chunk-strategy semantic
+```
+
+- 文件头保留「资料来源 / 原文链接 / 发布年份」，`_sources.json` 记录已抓 URL，重复运行自动跳过；
+- 只抓公开发布的政府/事业单位技术资料，正文里的章节标题会转成二级标题，切分按章节边界进行。
+
+#### 切换 embedding 模型后重刷向量
+
+Chroma 不记录向量由哪个模型生成。把 `EMBEDDING_MODE` 从 `api` 换成 `local`（或反向）后，库里的旧向量和新查询向量不在同一空间，必须先整体重算：
+
+```bash
+python scripts/reembed_collection.py            # dry-run：只打印配置与集合规模
+python scripts/reembed_collection.py --apply    # 只重算向量，不改内容、不删文档
+```
+
+重算期间建议停掉后端，完成后重启，让检索与 BM25 索引都加载新向量。
+
 ---
 
 ## 模型配置
 
 | 用途 | 默认模型 | 备选 |
 |------|---------|------|
-| 问答推理（LLM） | `qwen3.6-plus`（API） | `qwen3-8b`（本地） |
+| 问答推理（LLM） | `qwen3.8-2.4t-a95b`（API） | `qwen3-8b`（本地） |
 | 视觉理解 | `qwen3-vl-plus`（API） | — |
 | 文本向量化 | `Qwen3-Embedding-0.6B`（本地） | `text-embedding-v4`（API） |
 | 图像向量化 | `Qwen3-VL-Embedding-2B`（本地固定） | — |
@@ -158,9 +238,11 @@ bash launch.sh
 ```env
 LLM_MODE=api                    # api（DashScope）或 local
 EMBEDDING_MODE=local            # local 或 api
+LOCAL_EMBEDDING_MODEL=F:/models/Qwen3-Embedding-0.6B   # 本地向量模型路径（mode=local 时必填）
 RERANKER_MODE=local             # local 或 api
 ENABLE_RERANK=true              # false 可关闭精排降低延迟
 CHUNK_STRATEGY=semantic         # 切分策略
+ENABLE_AGRI_METADATA=true       # 入库时抽取农业元数据（作物/病害/年份等）
 ```
 
 ---
@@ -173,7 +255,8 @@ Agent 可以调用以下工具，根据问题自主选择检索策略：
 
 | 工具 | 功能 |
 |------|------|
-| `knowledge_base_search` | 文本混合检索（稠密+稀疏+RRF+精排） |
+| `knowledge_base_search` | 文本混合检索（稠密+稀疏+RRF+精排），自动识别农业槽位并过滤 |
+| `knowledge_base_search_structured` | 显式指定作物/病害/地区/年份/资料类型的结构化检索 |
 | `knowledge_base_search_with_filter` | 限定在特定文件内检索 |
 | `image_search` | 跨模态图像检索（文本→图片） |
 | `query_rewrite` | 复杂问题拆解为多个子查询 |
@@ -253,15 +336,100 @@ data: [DONE]
 ### 检索评估
 
 ```bash
-# 离线评估（BM25，无需 API）
-python scripts/evaluate.py \
-  --dataset ./data/eval_dataset.jsonl \
-  --corpus ./data/eval_corpus \
+# 中文农业评测集（在线，完整流水线；需要已建好的 Chroma 索引）
+python scripts/evaluate.py --online \
+  --dataset ./data/eval_dataset_zh.jsonl \
   --k 1 3 5 10
 
-# 在线评估（完整流水线）
-python scripts/evaluate.py --online --dataset ./data/eval_dataset.jsonl
+# 口语化问法（更接近真实用户）
+python scripts/evaluate.py --online \
+  --dataset ./data/eval_dataset_zh_paraphrase.jsonl \
+  --k 1 3 5 10
+
+# 消融：仅 Dense / 仅 Sparse
+python scripts/evaluate.py --online --ablation dense \
+  --dataset ./data/eval_dataset_zh_paraphrase.jsonl
+python scripts/evaluate.py --online --ablation sparse \
+  --dataset ./data/eval_dataset_zh_paraphrase.jsonl
+
+# 打开农业元数据过滤（按问题自动抽取 crop/disease/growth_stage）
+python scripts/evaluate.py --online --filters \
+  --dataset ./data/eval_dataset_zh_paraphrase.jsonl
 ```
+
+`data/eval_dataset.jsonl` 是早期的人事/技术模板，与当前农业语料不匹配，不要再作为基线。
+
+### 中文农业评测集
+
+三份文件，均以 `data/documents/zh/` 的 36 篇农业农村部方案为事实来源：
+
+| 文件 | 条数 | 用途 |
+|------|------|------|
+| `data/eval_dataset_zh.jsonl` | 70 | 直述式问题，覆盖 35/36 篇文档，用于回归和分类型统计 |
+| `data/eval_dataset_zh_paraphrase.jsonl` | 30 | 口语化问法，不带文档标题词，用于衡量真实用户检索效果 |
+| `data/eval_dataset_zh_negative.jsonl` | 10 | 知识库外问题，用于检验“拒答而非编造”，不参与 Recall 统计 |
+
+字段沿用 `evaluate.py` 的 `question / answer / source / page / category`：
+
+- `source` 是真实 `.md` 文件名，评测按文件名（去扩展名）匹配；
+- `category` 取值 `factual / summary / reasoning / comparison / paraphrase / negative`；
+- 负例题额外带 `expected_behavior: "refuse"`，`source` 为空，不能直接跑 `evaluate.py`；
+  应通过 `/v1/query` 逐条提问，检查回答是否明确说明“知识库未收录”。
+- 负例题实测（2026-11）：模型会先说明“知识库未找到”，但随后仍可能用互联网资料补充
+  （例如苹果腐烂病会给出刮治时期和药剂）。是否允许这种“标注来源的补充回答”属于产品策略，
+  当前按“先声明未收录、不得把外部内容说成知识库依据”判定。
+- `2026_玉米大豆水肥一体化单产提升技术方案.md` 因原文只剩表格单元格、语句不完整，未出题。
+
+标注校验方式：每条答案都要求能从原文逐字定位（quote 子串匹配），答案中的数字还需在原文按顺序出现；70 条直述题全部通过，因此答案可追溯到具体方案。
+
+### 基准结果
+
+环境：562 个 chunk（其中中文 280 个），`semantic` 切分，`chunk_size=1024`，
+本地 `Qwen/Qwen3-Embedding-0.6B`，`ENABLE_RERANK=false`，未加农业过滤。
+
+**直述式（70 条）**
+
+| 方法 | Recall@1 | Recall@3 | Recall@10 | MRR@10 | NDCG@10 | Precision@10 |
+|------|----------|----------|-----------|--------|---------|--------------|
+| 混合检索（Dense+Sparse+RRF） | 90.00% | 100.00% | 100.00% | 0.9500 | 0.9631 | 40.00% |
+| 仅 Dense | **91.43%** | 100.00% | 100.00% | **0.9524** | **0.9646** | 40.00% |
+| 仅 Sparse（BM25） | 82.86% | 100.00% | 100.00% | 0.9095 | 0.9330 | 30.29% |
+
+**口语化（30 条）**
+
+| 方法 | Recall@1 | Recall@3 | Recall@5 | Recall@10 | MRR@10 | NDCG@10 |
+|------|----------|----------|----------|-----------|--------|---------|
+| 混合检索（Dense+Sparse+RRF） | **63.33%** | **83.33%** | **93.33%** | **96.67%** | 0.7417 | 0.7970 |
+| 仅 Dense | 56.67% | 76.67% | 90.00% | 96.67% | 0.7039 | 0.7682 |
+| 仅 Sparse（BM25） | **63.33%** | 80.00% | 93.33% | 93.33% | **0.7444** | **0.7915** |
+
+**农业元数据过滤（混合检索，开/关对比，`--filters` 复现）**
+
+| 数据集 | Recall@1 关 → 开 | Recall@5 关 → 开 | Recall@10 关 → 开 | MRR@3 关 → 开 |
+|--------|------------------|------------------|-------------------|---------------|
+| 直述式 | 90.0% → 88.6% | 100% → 97.1% | 100% → 97.1% | 0.9500 → 0.9262 |
+| 口语化 | 63.3% → 63.3% | 93.3% → 86.7% | 96.7% → 90.0% | 0.7111 → 0.7278 |
+
+### 结果解读与优化方向
+
+1. **直述式已饱和，口语化才是瓶颈。** 直述题在 K=3 全部命中，但口语化题 Recall@1 只有 63%，
+   Recall@10 才到 97%：检索“找得到”，但“排不准”。口语题上 BM25（63.3%）反而强于 Dense（56.7%），
+   说明真实问法更依赖“小麦/蓟马”这类字面词；Hybrid 的 Recall@5 最高（93.3%），融合主要改善中段排序。
+   优化重点应放在 top-1 排序与词面归一，而不是继续扩召回。
+2. **超长文档挤占 top-k。** `2026_小麦秋冬种技术明白纸.md` 占 99/562 个 chunk（17.6%），
+   在 11 条非 top-1 口语题中有 9 条的 top-3 出现该文档。建议在 RRF 后加“每来源最多 N 块”配额或 MMR。
+3. **近似重复版本互相抢答。** 直述题 7 条非 top-1 全部是版本或区域差异：
+   2023/2024 番茄潜叶蛾、豇豆、棉花，2024/2025 果树冻害，以及“全国版 vs 西南版”大豆玉米，
+   排名均为第 2。需要年份/区域仲裁（显式过滤或同版本优先），仅靠文本相似度无法区分。
+4. **过滤条件宁少勿多。** 当前 `understand_query` 会抽出 `crop / disease / growth_stage`，
+   而 chunk 的 `crop` 是单值主作物、`growth_stage` 也是单值。硬过滤 `growth_stage`（如“灌浆期”）
+   或 `disease` 会让正确文档直接掉出 top-10（直述集 3 条、口语集 3 条）；口语集 MRR@3 反而略升
+   （0.711 → 0.728），说明过滤提升了“排得准”，代价是“找得全”。
+   建议：`crop` 改匹配多值 `crops` 字段，`growth_stage` 默认不参与硬过滤，空结果时逐槽位放松。
+5. **别名与时令词仍有缺口。** `西红柿 → 番茄`、`豆角 → 豇豆` 已能正确归一；
+   “送嫁肥”“闷棚”等农事俗语没有进入词典，口语题里仍会命中小麦/蔬菜通用文档。
+6. **Reranker 尚未启用。** 上表 `ENABLE_RERANK=false`。top-1 的 37% 失败正是精排的用武之地，
+   下一步可在口语集上对比开启前后的 MRR@1。
 
 ### 切分策略对比
 
@@ -275,23 +443,21 @@ python scripts/evaluate.py --chunk-ablation all
 
 内置六种策略：`fixed` | `sentence` | `paragraph` | `markdown` | `recursive` | `semantic`（默认）
 
-### 基准结果
-
-173 条问答对，`chunk_size=1024`，`semantic` 切分：
-
-| 方法 | Recall@1 | Recall@5 | MRR@5 | NDCG@5 |
-|------|----------|----------|-------|--------|
-| 混合检索（Dense+Sparse+RRF） | 76.30% | 94.80% | 0.8357 | 0.8638 |
-| 混合检索 + Reranker 精排 | **86.71%** | **95.95%** | **0.9094** | **0.9223** |
-
 ---
 
 ## 目录结构
 
 ```
 agricultural-research-rag/
-├── config/settings.py              # 全局配置（pydantic-settings）
+├── config/
+│   ├── settings.py                 # 全局配置（pydantic-settings）
+│   └── agri_lexicon.json           # 农业词典（作物/病害/虫害/农药/地区/生育期）
 ├── src/
+│   ├── agri/                       # 农业语义层（纯规则，无外部依赖）
+│   │   ├── lexicon.py              #   别名归一 / 实体识别 / 分词增强
+│   │   ├── metadata_extractor.py   #   文档与 chunk 元数据抽取
+│   │   ├── filters.py              #   Chroma where + BM25 元数据过滤
+│   │   └── query_understanding.py  #   查询槽位、意图与查询扩展
 │   ├── document_parser/            # 文档解析层
 │   │   ├── text_parser.py          #   Markdown 结构化解析
 │   │   ├── vision_parser.py        #   Qwen-VL 图像转文本
@@ -322,6 +488,7 @@ agricultural-research-rag/
 │   ├── mineru_ocr.py               #   MinerU OCR 预处理
 │   ├── ingest_ocr_output.py        #   文本入库
 │   ├── ingest_images_from_md.py    #   图片入库
+│   ├── backfill_agri_metadata.py   #   旧索引农业元数据回填（非破坏性）
 │   └── evaluate.py                 #   检索评估
 ├── tests/                          # 单元测试
 ├── run_server.py                   # 后端启动入口
@@ -334,11 +501,15 @@ agricultural-research-rag/
 ## 测试
 
 ```bash
-pytest tests/ -v
+# Windows 下必须指定 --basetemp，否则会因临时目录权限失败
+pytest tests/ -q --basetemp=.pytest_cache/tmp
 
 # VL embedding 环境诊断
 python tests/diagnose_vl_embedding.py
 ```
+
+当前共 238 个测试，重组件（LLM、Chroma、HTTP）均已 mock；其中 `tests/test_agri_*.py`
+与 `tests/test_query_understanding.py` 是纯规则测试，不需要任何模型即可运行。
 
 ---
 
