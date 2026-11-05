@@ -104,6 +104,32 @@ class ChromaVectorStore:
         logger.info(f"[ChromaStore] 共写入 {len(all_ids)} 条文档")
         return all_ids
 
+    def reembed_all_documents(self, batch_size: int = 16) -> int:
+        """
+        用当前 embedding 后端重算集合内所有文档的向量。
+
+        仅替换 embedding，不改动文档内容与元数据；切换 embedding 模型后必须执行，
+        否则同一集合里会混入不同模型产生的向量。返回处理的文档数。
+        """
+        col = self._client.get_collection(self.collection_name)
+        result = col.get(include=["documents"])
+        ids: list[str] = result.get("ids", [])
+        texts: list[str] = result.get("documents", [])
+        total = len(ids)
+        if total == 0:
+            logger.warning(f"[ChromaStore] 集合 '{self.collection_name}' 为空，无需重算")
+            return 0
+
+        for start in range(0, total, batch_size):
+            batch_ids = ids[start : start + batch_size]
+            batch_texts = texts[start : start + batch_size]
+            vectors = self._embedding_fn.embed_documents(batch_texts)
+            col.update(ids=batch_ids, embeddings=vectors)
+            done = min(start + batch_size, total)
+            logger.info(f"[ChromaStore] 重算向量 {done}/{total}")
+
+        return total
+
     # ──────────────────────────────────────────────────────────────────────
     # 读取 / 检索
     # ──────────────────────────────────────────────────────────────────────

@@ -241,17 +241,19 @@ def retrieve_offline(
 
 
 def retrieve_online(
-    retriever, query: str, k: int
+    retriever, query: str, k: int, filters: dict | None = None
 ) -> list[dict]:
-    """使用完整 Hybrid 检索流水线。"""
+    """使用完整 Hybrid 检索流水线（可选农业元数据过滤）。"""
     from config.settings import get_settings
     _s = get_settings()
+    # final_k 必须不小于评估的 K，否则 Recall@10 会被 settings.final_top_k（默认 5）截断
     docs = retriever.retrieve(
         query,
-        dense_k=_s.dense_top_k,
-        sparse_k=_s.sparse_top_k,
-        rerank_k=_s.rerank_top_k,
-        final_k=_s.final_top_k,
+        dense_k=max(k, _s.dense_top_k),
+        sparse_k=max(k, _s.sparse_top_k),
+        rerank_k=max(k, _s.rerank_top_k),
+        final_k=max(k, _s.final_top_k),
+        filters=filters,
     )
     return [
         {
@@ -488,6 +490,11 @@ def parse_args() -> argparse.Namespace:
         help="使用在线模式（完整 Dense+Sparse+Reranker 流水线）",
     )
     parser.add_argument(
+        "--filters",
+        action="store_true",
+        help="在线模式下按问题自动提取农业元数据过滤条件（作物/病害/地区/年份）",
+    )
+    parser.add_argument(
         "--ablation",
         choices=["dense", "sparse"],
         default=None,
@@ -534,6 +541,8 @@ def main() -> None:
     if args.chunk_ablation:
         if args.online:
             logger.warning("--chunk-ablation 仅在离线模式下有效，忽略 --online。")
+        if args.filters:
+            logger.warning("--filters 仅在在线模式下有效，已忽略。")
         if not args.corpus.exists():
             logger.error(f"语料库目录不存在：{args.corpus}")
             sys.exit(1)
@@ -584,11 +593,21 @@ def main() -> None:
         logger.info("使用在线模式（完整 RAG 流水线）")
         retriever = init_online_retriever(args.ablation)
 
-        def retrieve_fn(query: str, k: int):
-            return retrieve_online(retriever, query, k)
+        if args.filters:
+            from src.agri.query_understanding import understand_query
+
+            def retrieve_fn(query: str, k: int):
+                return retrieve_online(
+                    retriever, query, k, filters=understand_query(query).filters or None
+                )
+        else:
+            def retrieve_fn(query: str, k: int):
+                return retrieve_online(retriever, query, k)
     else:
         mode = "离线/BM25"
         logger.info("使用离线模式（BM25 稀疏检索）")
+        if args.filters:
+            logger.warning("--filters 仅在在线模式下有效，已忽略。")
 
         if not args.corpus.exists():
             logger.error(f"语料库目录不存在：{args.corpus}")
@@ -608,7 +627,8 @@ def main() -> None:
 
     # ── 展示结果 ──────────────────────────────────────────────────────────
     ablation_label = f"（消融：仅{args.ablation}）" if args.ablation else ""
-    print_results(output, sorted(args.k), f"{mode}{ablation_label}", elapsed)
+    filter_label = "（农业过滤）" if args.filters else ""
+    print_results(output, sorted(args.k), f"{mode}{ablation_label}{filter_label}", elapsed)
 
     print(f"  总耗时       : {time.perf_counter() - _start_time:.1f}s")
 
