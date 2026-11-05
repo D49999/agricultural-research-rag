@@ -1,0 +1,10 @@
+{"question": "苹果树腐烂病的防治药剂和刮治时间是什么？", "answer": "知识库未收录苹果腐烂病相关内容，应明确说明无法回答，不得编造药剂或刮治时期。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "设施草莓灰霉病在低温高湿条件下的用药方案是什么？", "answer": "知识库未收录设施草莓灰霉病相关内容，应说明无相关资料，不得给出具体药剂和浓度。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "水稻田防除稗草和千金子应使用哪些除草剂、每亩用量多少？", "answer": "知识库中的水稻方案只涉及病虫害防控，未收录稻田除草剂品种与用量，应如实说明。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "2025年小麦重大病虫害防控技术方案中，赤霉病的防治指标是多少？", "answer": "知识库没有2025年小麦重大病虫害防控方案，只有2024年方案和2026年春季管理意见，应说明年份缺失。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "转基因抗虫棉品种审定的具体流程和需要提交哪些材料？", "answer": "知识库未收录品种审定流程与申报材料，应说明该问题超出资料范围。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "农用无人机购置补贴的申请条件和补贴标准是多少？", "answer": "知识库未收录农机购置补贴政策，应说明无补贴标准相关信息，不得编造金额。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "土壤重金属镉污染的修复技术和安全利用标准是什么？", "answer": "知识库未收录土壤重金属污染修复内容，应明确告知无法回答。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "马铃薯晚疫病的发病条件和推荐防治药剂有哪些？", "answer": "知识库只有马铃薯科学施肥内容，未收录晚疫病发生条件与防治药剂，应说明资料不足。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "生猪口蹄疫的免疫程序和抗体合格标准是什么？", "answer": "知识库为农作物技术资料，未收录生猪疫病免疫内容，应说明超出知识库范围。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
+{"question": "茶园遭受霜冻后的保险理赔流程和赔付比例是怎样的？", "answer": "知识库只有茶园冻害修剪与恢复措施，未收录保险理赔流程和赔付比例，应如实说明。", "source": "", "page": 0, "category": "negative", "expected_behavior": "refuse"}
