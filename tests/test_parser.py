@@ -209,6 +209,30 @@ class TestStructureAwareChunker:
         docs = chunker.chunk(blocks)
         assert len(docs) >= 2
 
+    def test_chinese_text_is_split_by_char_count(self):
+        """中文没有空格，token 估算必须按字数折算，否则整篇会挤进一个 chunk。"""
+        chunker = StructureAwareChunker(
+            chunk_size=128, chunk_overlap=1, source_name="治方案.md"
+        )
+        # 单个文本块约 192 token，已超过 chunk_size，因此每个块都应单独成 chunk；
+        # 若按英文空格估算，三个块会被合并成 1 个 chunk。
+        paragraph = "水稻稻瘟病在破口期至齐穗期重点防控，可选用三环唑、稻瘟灵等药剂进行防治。" * 8
+        blocks = [self._make_text_block(paragraph) for _ in range(3)]
+        docs = chunker.chunk(blocks)
+
+        assert len(docs) == 3
+        assert all(doc.metadata["chunk_tokens"] <= 210 for doc in docs)
+
+    def test_chinese_overlap_does_not_duplicate_whole_chunk(self):
+        chunker = StructureAwareChunker(
+            chunk_size=64, chunk_overlap=8, source_name="治方案.md"
+        )
+        blocks = [self._make_text_block("稻瘟病防治要点。" * 12) for _ in range(2)]
+        docs = chunker.chunk(blocks)
+        assert len(docs) >= 2
+        # 重叠只应带少量上文，不能把上一 chunk 全文复制过来
+        assert len(docs[1].page_content) < len(docs[0].page_content) * 2
+
     def test_metadata_source_set(self):
         chunker = StructureAwareChunker(source_name="my_doc.pdf")
         blocks = [self._make_text_block("content")]

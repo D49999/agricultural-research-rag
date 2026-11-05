@@ -22,6 +22,11 @@ from langchain_core.documents import Document
 from loguru import logger
 
 from config.settings import get_settings
+from src.agri.metadata_extractor import (
+    extract_chunk_metadata,
+    extract_document_metadata,
+    format_metadata,
+)
 from .base_parser import BlockType, ParsedBlock
 
 settings = get_settings()
@@ -43,13 +48,26 @@ STRATEGY_LABEL = {
 
 _WORDS_PER_TOKEN = 0.75
 
+# 中文没有空格分词，按「字数」估算；约 1.5 个汉字 ≈ 1 个 token
+_CJK_CHARS_PER_TOKEN = 1.5
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
 
 def _word_count(text: str) -> int:
     return len(text.split())
 
 
 def _token_estimate(text: str) -> int:
-    return int(_word_count(text) / _WORDS_PER_TOKEN)
+    """估算 token 数：中文按字数，其余按空格分词。
+
+    早期实现只数空格分词，中文长文档会被算成个位数 token，
+    导致整篇文档挤进一个 chunk，这里按 CJK 字数单独折算。
+    """
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    latin_words = len(_CJK_RE.sub(" ", text).split())
+    return int(cjk / _CJK_CHARS_PER_TOKEN + latin_words / _WORDS_PER_TOKEN)
 
 
 # ── 内部工具 ──────────────────────────────────────────────────────────────
@@ -210,6 +228,7 @@ class StructureAwareChunker:
     chunk_size    : 目标 chunk 大小（近似 token 数）。
     chunk_overlap : 相邻 chunk 之间的重叠量（近似 token 数）。
     source_name   : 原始文档名称，写入每个 Document 的元数据。
+    doc_metadata  : 可选的文档级农业元数据；不传时在首次 chunk() 时自动抽取。
     """
 
     def __init__(
@@ -217,13 +236,23 @@ class StructureAwareChunker:
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
         source_name: str = "",
+        doc_metadata: dict | None = None,
     ) -> None:
         self.chunk_size = chunk_size or settings.chunk_size
         self.chunk_overlap = chunk_overlap or settings.chunk_overlap
         self.source_name = source_name
+        self.doc_metadata = doc_metadata
 
     def chunk(self, blocks: list[ParsedBlock]) -> list[Document]:
         """主入口。返回扁平的 LangChain Document 列表。"""
+        if settings.enable_agri_metadata and self.doc_metadata is None:
+            doc_text = "\n".join(b.content for b in blocks if b.content)
+            self.doc_metadata = extract_document_metadata(doc_text, self.source_name)
+            logger.info(
+                f"[AgriMeta] {self.source_name or '(unknown)'}: "
+                f"{format_metadata(self.doc_metadata)}"
+            )
+
         documents: list[Document] = []
         buffer = _ChunkBuffer(parts=[], page_num=blocks[0].page_num if blocks else 0)
         current_header = ""
@@ -309,21 +338,39 @@ class StructureAwareChunker:
             "header_context": buffer.header_context,
             "chunk_tokens": _token_estimate(text),
         }
+        meta.update(self._agri_meta(text))
         return [Document(page_content=text, metadata=meta)]
 
+    def _agri_meta(self, text: str) -> dict[str, Any]:
+        """抽取 chunk 级农业元数据；开关关闭时返回空字典。"""
+        if not settings.enable_agri_metadata:
+            return {}
+        return extract_chunk_metadata(text, self.doc_metadata or {})
+
     def _extract_overlap(self, buffer: _ChunkBuffer) -> str:
-        words = buffer.text.split()
+        """取上一 chunk 末尾的重叠内容。
+
+        英文按空格分词截取；中文按字符截取（按词截取会把整段都带进下一个 chunk）。
+        """
+        text = buffer.text
+        cjk = len(_CJK_RE.findall(text))
+        if cjk and cjk >= len(text) * 0.3:
+            n_chars = int(self.chunk_overlap * _CJK_CHARS_PER_TOKEN)
+            return text[-n_chars:] if n_chars > 0 else ""
+        words = text.split()
         n_words = int(self.chunk_overlap / _WORDS_PER_TOKEN)
         return " ".join(words[-n_words:]) if len(words) > n_words else " ".join(words)
 
     def _build_meta(self, block: ParsedBlock, header_context: str) -> dict[str, Any]:
-        return {
+        meta = {
             "source": self.source_name,
             "page_num": block.page_num,
             "block_type": block.block_type.value,
             "header_context": header_context,
             **block.metadata,
         }
+        meta.update(self._agri_meta(block.content))
+        return meta
 
 
 # ── 高层 Block 入口 ───────────────────────────────────────────────────────
@@ -334,17 +381,21 @@ def chunk_blocks(
     chunk_size: int,
     chunk_overlap: int,
     source_name: str,
+    doc_metadata: dict | None = None,
 ) -> list[Document]:
     """
     对 ParsedBlock 列表应用指定策略，返回 Document 列表。
     strategy == "semantic" 时使用 StructureAwareChunker 保留版面结构；
     其余策略将块内容合并为文本后调用 chunk_text。
+
+    doc_metadata 为可选的文档级农业元数据；不传时自动抽取。
     """
     if strategy == "semantic":
         return StructureAwareChunker(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             source_name=source_name,
+            doc_metadata=doc_metadata,
         ).chunk(blocks)
 
     parts = []
@@ -357,4 +408,13 @@ def chunk_blocks(
         else:
             parts.append(b.content.strip())
     text = "\n\n".join(parts)
-    return chunk_text(text, source_name, strategy, chunk_size, chunk_overlap)
+    documents = chunk_text(text, source_name, strategy, chunk_size, chunk_overlap)
+
+    if settings.enable_agri_metadata and documents:
+        doc_meta = doc_metadata or extract_document_metadata(text, source_name)
+        logger.info(
+            f"[AgriMeta] {source_name or '(unknown)'}: {format_metadata(doc_meta)}"
+        )
+        for doc in documents:
+            doc.metadata.update(extract_chunk_metadata(doc.page_content, doc_meta))
+    return documents
