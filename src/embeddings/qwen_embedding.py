@@ -69,15 +69,17 @@ class QwenLocalEmbeddings(Embeddings):
         self.instruction = instruction or "Given a web search query, retrieve relevant passages that answer the query"
 
         use_cuda = torch.cuda.is_available()
+        # CPU 上 fp16 需要不断做精度转换，比 fp32 慢一个数量级，因此按设备选择精度
+        dtype = torch.float16 if use_cuda else torch.float32
         if is_flash_attn_2_available() and use_cuda:
             self._model = AutoModel.from_pretrained(
                 self.model_name, trust_remote_code=True,
-                attn_implementation="flash_attention_2", dtype=torch.float16,
+                attn_implementation="flash_attention_2", dtype=dtype,
                 local_files_only=True,
             )
         else:
             self._model = AutoModel.from_pretrained(
-                self.model_name, trust_remote_code=True, dtype=torch.float16,
+                self.model_name, trust_remote_code=True, dtype=dtype,
                 local_files_only=True,
             )
         if use_cuda:

@@ -14,6 +14,7 @@ DELETE /v1/collection         重置向量集合。
 """
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -150,6 +151,12 @@ StoreDep = Annotated[ChromaVectorStore, Depends(get_store)]
 ImageStoreDep = Annotated[ImageChromaStore, Depends(get_image_store)]
 
 
+# Agent/检索器是 lifespan 里创建的共享单例：并发跑同一实例既没有收益，
+# 也可能让底层模型/向量库互相干扰，因此问答接口串行执行。
+# 但耗时的同步推理必须放到线程里，否则事件循环被占住，连 /health 都会超时。
+_QUERY_LOCK = asyncio.Lock()
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])
@@ -176,7 +183,10 @@ async def query(request: QueryRequest, agent: AgentDep) -> QueryResponse:
     history = [m.model_dump() for m in request.chat_history]
 
     try:
-        result = agent.query(request.question, chat_history=history)
+        async with _QUERY_LOCK:
+            result = await asyncio.to_thread(
+                agent.query, request.question, chat_history=history
+            )
     except Exception as exc:
         logger.exception("问答错误：{}", exc)
         raise HTTPException(
