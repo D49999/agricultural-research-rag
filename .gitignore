@@ -27,3 +27,4 @@ CLAUDE1.md
 .workbuddy/
 data/modelscope_cache/
 data/knowledge_graph/
+data/runtime/

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     # ── 模型名称 ───────────────────────────────────────────────────────────
     llm_mode: str = "api"                        # "api" 使用 DashScope，"local" 使用本地部署模型
-    llm_model: str = "qwen3.6-plus"          # API 模式使用的模型名称
+    llm_model: str = "qwen3.8-2.4t-a95b"          # API 模式使用的模型名称
     local_llm_base_url: str = "http://localhost:9000/v1"  # 本地模型地址
     local_llm_model: str = "qwen3-8b"              # 本地模型名称
     vl_model: str = "qwen3-vl-plus"               # Qwen3-VL 多模态视觉
@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     chunk_size: int = 1024
     chunk_overlap: int = 32
     max_workers: int = 4
+    # 入库时抽取农业元数据（作物/病害/地区/年份/资料类型），供结构化检索过滤
+    enable_agri_metadata: bool = True
 
     # ── 检索参数 ───────────────────────────────────────────────────────────
     dense_top_k: int = 10
@@ -66,7 +68,7 @@ class Settings(BaseSettings):
     # ── LLM 生成参数 ───────────────────────────────────────────────────────
     llm_temperature: float = 0.7
     llm_max_tokens: int = 2048
-    llm_request_timeout: int = 30
+    llm_request_timeout: int = 180
 
     # ── 文献搜索 skill（paper_search / paper_ingest） ─────────────────────
     # 搜索到的论文保存为 markdown 的目录（摘要级与全文级共用）
