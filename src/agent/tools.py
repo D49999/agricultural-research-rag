@@ -7,6 +7,8 @@ Agent 在生成答案前可调用这些工具获取上下文。
 工具清单
 --------
 - knowledge_base_search            : 农业科研文本知识库检索（稠密 + 稀疏 + 精排）
+                                     自动识别作物/病害/地区/年份并收窄检索范围
+- knowledge_base_search_structured : 由 Agent 显式指定农业条件的结构化检索
 - knowledge_base_search_with_filter: 限定来源文件的文本检索
 - image_search                     : 农业图像库跨模态检索（文本 query → 相关图片）
 - query_rewrite                    : 将复杂问题改写为多个子查询（需要 LLM）
@@ -22,11 +24,106 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from config.settings import get_settings
+from src.agri.filters import describe_filters, normalize_filters
+from src.agri.query_understanding import QueryUnderstanding, understand_query
 
 if TYPE_CHECKING:
     from src.retrieval.hybrid_retriever import HybridRetriever
 
 _settings = get_settings()
+
+
+# ---------------------------------------------------------------------------
+# 内部辅助
+# ---------------------------------------------------------------------------
+
+def _retrieve_documents(
+    retriever: "HybridRetriever",
+    query: str,
+    filters: dict[str, Any] | None,
+) -> tuple[list, bool]:
+    """
+    执行带农业元数据过滤的检索，返回 (documents, relaxed)。
+
+    优先使用 HybridRetriever.retrieve_with_info() 获取「过滤是否被放宽」；
+    对测试替身或其他检索器，退化为普通 retrieve() 调用。
+    """
+    filters = normalize_filters(filters)
+    if not filters:
+        return retriever.retrieve(query), False
+
+    supports_info = getattr(type(retriever), "retrieve_with_info", None) is not None
+    if supports_info:
+        outcome = retriever.retrieve_with_info(query, filters=filters)
+        return outcome.documents, outcome.relaxed
+
+    try:
+        docs = retriever.retrieve(query, filters=filters)
+    except TypeError:
+        docs = retriever.retrieve(query)
+
+    if docs:
+        return docs, False
+
+    # 过滤后为空：放宽一次，避免「有资料但条件太窄」导致空回答
+    try:
+        return retriever.retrieve(query), True
+    except TypeError:
+        return docs, True
+
+
+def _doc_to_result(
+    doc: Any,
+    rank: int,
+    matched_query: str | None = None,
+) -> dict[str, Any]:
+    """把 Document 转成工具返回的统一结果结构（含农业元数据）。"""
+    metadata = doc.metadata or {}
+    result: dict[str, Any] = {
+        "rank": rank,
+        "content": doc.page_content,
+        "source": metadata.get("source", "unknown"),
+        "page": metadata.get("page_num", "?"),
+        "block_type": metadata.get("block_type", "text"),
+        "header_context": metadata.get("header_context", ""),
+    }
+    for field in (
+        "crop", "disease", "pest", "pesticide",
+        "region", "growth_stage", "variety", "year", "doc_type",
+    ):
+        if metadata.get(field) not in (None, ""):
+            result[field] = metadata[field]
+    if matched_query:
+        result["matched_query"] = matched_query
+    return result
+
+
+def _search_payload(
+    results: list[dict[str, Any]],
+    understanding: QueryUnderstanding | None = None,
+    relaxed: bool = False,
+    empty_message: str = "未找到相关内容。",
+) -> str:
+    """组装检索工具的 JSON 返回，附上查询理解与过滤状态。"""
+    payload: dict[str, Any] = {"results": results}
+
+    if not results:
+        payload["message"] = empty_message
+
+    if understanding is not None:
+        payload["query_understanding"] = understanding.as_dict()
+        if understanding.filters:
+            payload["applied_filters"] = understanding.filters
+            payload["filter_description"] = describe_filters(understanding.filters)
+
+    if relaxed:
+        payload["relaxed"] = True
+        payload["relaxation_note"] = (
+            "严格条件下未命中，已放宽为全库检索；回答时应提示用户"
+            "「未找到完全匹配的资料，以下为相近内容」。"
+        )
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -53,33 +150,99 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
         在农业科研文本知识库中检索与查询相关的段落（不含图片）。
 
         当需要从已上传的农业科研文档中获取事实性文本信息时使用此工具。
-        返回包含来源元数据的相关段落 JSON 列表。
-        如果用户需要查找图片/图表/示意图等视觉内容，请改用 image_search。
+        会自动识别问题中的作物、病害、虫害、农药、地区、年份和资料类型，
+        并据此收窄检索范围；若条件过严未命中，会自动放宽并在结果中标记
+        relaxed=true。
 
         参数
         ----
         query : 自然语言问题或搜索短语。
+
+        返回
+        ----
+        包含来源元数据、农业元数据（作物/病害/年份/资料类型）与
+        query_understanding（槽位识别结果）的 JSON。
         """
         logger.info(f"[Tool:knowledge_base_search] query='{query[:80]}'")
-        docs = retriever.retrieve(query)
 
-        if not docs:
-            return json.dumps({"results": [], "message": "未找到相关内容。"})
-
-        results = []
-        for i, doc in enumerate(docs, start=1):
-            results.append(
-                {
-                    "rank": i,
-                    "content": doc.page_content,
-                    "source": doc.metadata.get("source", "unknown"),
-                    "page": doc.metadata.get("page_num", "?"),
-                    "block_type": doc.metadata.get("block_type", "text"),
-                    "header_context": doc.metadata.get("header_context", ""),
-                }
+        understanding = understand_query(query)
+        if understanding.filters:
+            logger.info(
+                f"[Tool:knowledge_base_search] 过滤条件："
+                f"{describe_filters(understanding.filters)}"
             )
 
-        return json.dumps({"results": results}, ensure_ascii=False, indent=2)
+        docs, relaxed = _retrieve_documents(retriever, query, understanding.filters)
+        results = [_doc_to_result(doc, i) for i, doc in enumerate(docs, start=1)]
+        return _search_payload(results, understanding, relaxed)
+
+    @tool
+    def knowledge_base_search_structured(
+        query: str,
+        crop: str = "",
+        disease: str = "",
+        pest: str = "",
+        pesticide: str = "",
+        region: str = "",
+        growth_stage: str = "",
+        doc_type: str = "",
+        variety: str = "",
+        year_from: str = "",
+    ) -> str:
+        """
+        按显式农业条件检索文本知识库。
+
+        当用户明确给出「作物 + 病害/虫害 + 地区 + 年份 + 资料类型」等条件时，
+        用此工具比 knowledge_base_search 更精确。所有参数均可留空，
+        留空时自动回退到问题本身的槽位识别结果。
+
+        参数
+        ----
+        query        : 自然语言问题。
+        crop         : 作物，如「水稻」「小麦」。
+        disease      : 病害，如「稻瘟病」。
+        pest         : 虫害，如「二化螟」。
+        pesticide    : 农药，如「吡虫啉」。
+        region       : 地区，如「长江中下游」「黑龙江」。
+        growth_stage : 生育期，如「分蘖期」「抽穗期」。
+        doc_type     : 资料类型：标准/审定公告/农药标签/技术规程/论文/试验报告。
+        variety      : 品种，如「郑单958」。
+        year_from    : 起始年份（字符串或数字），如「2020」。
+        """
+        logger.info(
+            f"[Tool:knowledge_base_search_structured] query='{query[:60]}' "
+            f"crop={crop} disease={disease} region={region} doc_type={doc_type}"
+        )
+
+        raw_filters: dict[str, Any] = {
+            "crop": crop,
+            "disease": disease,
+            "pest": pest,
+            "pesticide": pesticide,
+            "region": region,
+            "growth_stage": growth_stage,
+            "doc_type": doc_type,
+            "variety": variety,
+        }
+        if str(year_from).strip():
+            raw_filters["year_min"] = year_from
+
+        filters = normalize_filters(raw_filters)
+        understanding: QueryUnderstanding | None = None
+        if not filters:
+            understanding = understand_query(query)
+            filters = understanding.filters
+        else:
+            understanding = understand_query(query)
+            # 显式条件优先；仅在问题明确给出时间/资料类型时补充
+            for key in ("year_min", "doc_type"):
+                if key in understanding.filters and key not in filters:
+                    filters[key] = understanding.filters[key]
+            understanding.filters = filters
+
+        docs, relaxed = _retrieve_documents(retriever, query, filters)
+        results = [_doc_to_result(doc, i) for i, doc in enumerate(docs, start=1)]
+        return _search_payload(results, understanding, relaxed)
 
     @tool
     def knowledge_base_search_with_filter(query: str, source_file: str) -> str:
@@ -105,17 +268,12 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
                 {
                     "results": [],
                     "message": f"在 '{source_file}' 中未找到相关内容。",
-                }
+                },
+                ensure_ascii=False,
             )
 
         results = [
-            {
-                "rank": i,
-                "content": doc.page_content,
-                "source": doc.metadata.get("source", source_file),
-                "page": doc.metadata.get("page_num", "?"),
-                "block_type": doc.metadata.get("block_type", "text"),
-            }
+            _doc_to_result(doc, i)
             for i, (doc, _) in enumerate(docs[:5], start=1)
         ]
         return json.dumps({"results": results}, ensure_ascii=False, indent=2)
@@ -128,6 +286,7 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
         通常与 query_rewrite 配合使用：
         先调用 query_rewrite 获得子查询列表，
         再将 rewritten_queries 序列化为 JSON 字符串传入此工具。
+        每个子查询都会自动做农业槽位识别与元数据过滤。
 
         参数
         ----
@@ -147,28 +306,24 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
         seen_keys: set[str] = set()
         merged: list[dict] = []
         rank = 1
+        relaxed_queries: list[str] = []
 
         for q in query_list:
             if not q or not q.strip():
                 continue
-            docs = retriever.retrieve(q)
+
+            understanding = understand_query(q)
+            docs, relaxed = _retrieve_documents(retriever, q, understanding.filters)
+            if relaxed:
+                relaxed_queries.append(q)
+
             for doc in docs:
                 # 用内容前 120 字符作去重 key，避免重复片段
                 dedup_key = doc.page_content[:120]
                 if dedup_key in seen_keys:
                     continue
                 seen_keys.add(dedup_key)
-                merged.append(
-                    {
-                        "rank": rank,
-                        "content": doc.page_content,
-                        "source": doc.metadata.get("source", "unknown"),
-                        "page": doc.metadata.get("page_num", "?"),
-                        "block_type": doc.metadata.get("block_type", "text"),
-                        "header_context": doc.metadata.get("header_context", ""),
-                        "matched_query": q,
-                    }
-                )
+                merged.append(_doc_to_result(doc, rank, matched_query=q))
                 rank += 1
 
         if not merged:
@@ -177,11 +332,16 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
                 ensure_ascii=False,
             )
 
-        return json.dumps(
-            {"results": merged, "total_queries": len(query_list)},
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload: dict[str, Any] = {
+            "results": merged,
+            "total_queries": len(query_list),
+        }
+        if relaxed_queries:
+            payload["relaxed_queries"] = relaxed_queries
+            payload["relaxation_note"] = (
+                "部分子查询在严格条件下未命中，已放宽为全库检索。"
+            )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     _image_top_k_default = _settings.image_top_k
 
@@ -229,6 +389,7 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
 
     tools = [
         knowledge_base_search,
+        knowledge_base_search_structured,
         knowledge_base_search_with_filter,
         multi_round_search,
         image_search,
@@ -259,12 +420,15 @@ def build_retrieval_tools(retriever: "HybridRetriever", llm: Any = None) -> list
             logger.info(f"[Tool:query_rewrite] 原始问题='{query[:80]}'")
 
             prompt = (
-                "请将以下问题改写为3个不同角度的检索查询，以提高农业科研知识库检索命中率。\n"
+                "请将以下农业科研问题改写为3个不同角度的检索查询，"
+                "以提高农业知识库检索命中率。\n"
                 f"原始问题：{query}\n\n"
                 "要求：\n"
                 "1. 每个查询从不同角度或使用不同关键词表达相同需求\n"
-                "2. 保持语义一致，不引入无关内容\n"
-                "3. 查询应简洁，适合关键词检索\n\n"
+                "2. 保留作物、病害、虫害、农药、品种、地区等专业术语，"
+                "必要时补充规范名或同义名（如 稻热病→稻瘟病）\n"
+                "3. 保持语义一致，不引入无关内容\n"
+                "4. 查询应简洁，适合关键词检索\n\n"
                 '严格以 JSON 格式返回，例如：{"queries": ["查询1", "查询2", "查询3"]}\n'
                 "只输出 JSON，不要任何其他内容。"
             )

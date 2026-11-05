@@ -62,13 +62,20 @@ def _summarize_tool_result(tool_name: str, raw: str) -> str:
         return f"生成 {len(queries)} 个子查询：" + "、".join(f'"{q}"' for q in queries[:3])
 
     if tool_name in ("knowledge_base_search", "multi_round_search",
-                     "knowledge_base_search_with_filter"):
+                     "knowledge_base_search_with_filter",
+                     "knowledge_base_search_structured"):
         if not results:
             return message or "未找到相关内容"
         total = data.get("total_queries")
         prefix = f"（共 {total} 轮检索）" if total else ""
+        filter_desc = data.get("filter_description")
+        filter_prefix = f"[{filter_desc}] " if filter_desc and filter_desc != "无" else ""
+        relax_suffix = "（已放宽过滤）" if data.get("relaxed") else ""
         snippets = "；".join(r.get("content", "")[:40] for r in results[:2])
-        return f"找到 {len(results)} 个片段{prefix}：{snippets}…"
+        return (
+            f"{filter_prefix}找到 {len(results)} 个片段{prefix}"
+            f"{relax_suffix}：{snippets}…"
+        )
 
     if tool_name == "image_search":
         if not results:
@@ -133,11 +140,26 @@ def _build_system_prompt() -> str:
 
 检索策略（文本与图像索引已分离，按需独立调用）：
 - 文本问题：用 knowledge_base_search 在农业科研文本库检索段落。
+- 条件明确的问题（作物、病害、地区、年份、资料类型）：用
+  knowledge_base_search_structured 显式传入条件，命中更精确。
 - 复杂/多概念问题：先用 query_rewrite 生成子查询，再用 multi_round_search 多轮文本检索。
 - 用户指定文件：改用 knowledge_base_search_with_filter。
 - 视觉/图像需求（图表、示意图、截图、曲线、架构图等）：用 image_search 在农业图像库中跨模态检索。
 - 如果问题同时涉及文本与图像，可依次调用 knowledge_base_search 和 image_search，结合结果回答。
 - 单次检索结果不理想时，可调整查询后重试或切换多轮检索。
+- 检索结果中的 query_understanding.expanded_queries 是规范名/同义扩展；若结果不足，
+  可把这些扩展查询序列化为 JSON 传给 multi_round_search 再检索一次。
+
+农业领域规则（重要）：
+- 涉及生产建议时，必须说明适用作物、区域、生育期和年份；资料未注明时，
+  明确写「资料未注明」，不要把单一地区/年份的结论泛化为通用结论。
+- 农药剂量、稀释倍数、安全间隔期、禁限用、残留限量类问题：只依据检索到的
+  标准、农药标签、登记资料回答，并注明发布机构/年份；若没有权威来源，
+  明确说明「知识库中无权威依据」，提示用户核对当地植保站或农业农村部门
+  发布的最新信息，不得凭模型记忆给出剂量。
+- 检索结果中出现 relaxed=true 时，表示严格条件下没有命中、已放宽为全库检索。
+  回答必须先说明「未找到完全匹配的资料，以下为相近内容」，再给出答案。
+- 资料类型与年份会影响结论有效性：引用旧标准或旧规程时，提醒用户核对是否已更新。
 
 扩展技能策略：
 - 数值计算：用 calculator，不要自己口算。

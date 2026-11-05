@@ -31,6 +31,7 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from config.settings import get_settings
+from src.agri.metadata_extractor import extract_document_metadata
 from src.document_parser.chunker import chunk_blocks
 from src.document_parser.html_converter import arxiv_html_to_markdown
 from src.document_parser.text_parser import TextParser
@@ -395,12 +396,14 @@ def _build_paper_chunks(
     file_path.write_text(markdown, encoding="utf-8")
 
     blocks = parser.parse(file_path)
+    doc_metadata = extract_document_metadata(markdown, filename)
     chunks = chunk_blocks(
         blocks=blocks,
         strategy=settings.chunk_strategy,
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
         source_name=filename,
+        doc_metadata=doc_metadata,
     )
     extra_meta = {
         "paper_id": paper["paper_id"],
@@ -410,7 +413,11 @@ def _build_paper_chunks(
         "paper_url": paper.get("url", ""),
         "entry_type": "literature",
         "ingest_depth": depth,
+        "doc_type": "论文",
+        "authority_level": 3,
     }
+    if paper.get("year"):
+        extra_meta["year"] = int(paper["year"])
     for chunk in chunks:
         chunk.metadata.update(extra_meta)
     return chunks
